@@ -1,0 +1,8 @@
+import socket
+ip = "192.168.1.1"  # 路由器 IP
+for port in range(1, 100):  # 扫 1-100 端口
+    sock = socket.socket()
+    result = sock.connect_ex((ip, port))
+    if result == 0:
+        print(f"端口 {port} 开了！")
+    sock.close()
