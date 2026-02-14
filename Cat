@@ -1,0 +1,255 @@
+# Mr.Asadflis
+import aiohttp
+import asyncio
+import aiofiles
+import logging
+import lxml
+import random
+from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+
+'''
+数据类~~~Data是数据流的数据！Proxy是代理
+池的数据！ 
+'''
+
+
+@dataclass
+class Data:
+    title: str
+    url: str
+
+
+@dataclass
+class Proxy:
+    url: str
+    weight: int = 10
+    failed: int = 0
+    speed: float = 0.0
+    total: int = 0
+    success: int = 0
+    checking: bool = False
+    last_check: float = 0.0
+
+    @property
+    def success_rate(self):
+        return self.success / self.total if self.total > 0 else 1.0  # 计算改代理的成功率
+
+    @property
+    def score(self):
+        return self.weight * self.success_rate / (self.speed + 1)  # 计算该代理的总分
+
+    def is_alive(self):
+        return self.weight > 0 and self.failed < 3
+        # 看它死了没
+
+
+class ProxyPool:
+    def __init__(self, urls):
+        self.proxies = [Proxy(url=u) for u in urls]
+        self.lock = asyncio.Lock()
+        self.running = True
+        
+    def get_proxy(self):
+        alive = [p for p in self.proxies if p.is_alive()]
+        if not alive:
+        	logging.info('代理死光光')
+        	return None
+        
+        
+
+
+class Spiders:
+    def __init__(self, url, headers, timeout, page_q, sem):
+        self.url = url
+        self.page_q = page_q
+        self.timeout = aiohttp.ClientTimeout(
+            total=timeout or 10,
+            connect=3,
+            sock_connect=3,
+            sock_read=timeout or 7
+        )
+        self.sem = sem
+        self.headers = headers or {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        # 哔哔一堆要用的参数
+
+    async def fetch(self, s, u):
+        try:
+            async with s.get(
+                u,
+                headers=self.headers,
+                timeout=self.timeout
+            ) as re:
+                if re.status == 200:
+                    return await re.text()
+
+        except asyncio.TimeoutError:
+            logging.error(f'来自{u}超时错误')
+            return None
+        except aiohttp.ClientConnectionError:
+            logging.error(f'来自{u}连接错误')
+            return None
+        except Exception as e:
+            logging.error(f'来自 {u} 的错误 {e}')
+            return None
+        '''就一个爬取功能和异常处理'''
+
+    async def worker(self, s, u):
+        async with self.sem:
+            re = await self.fetch(s, u)
+            if re:
+                await self.page_q.put((u, re))
+        '''worker把自己参数传给fetch，再用fetch方法获
+        取re，再把re放进队列		'''
+
+    async def run(self):
+        async with aiohttp.ClientSession() as s:
+            workers = [self.worker(s, u) for u in self.url]
+            await asyncio.gather(*workers)
+            await self.page_q.put(None)
+        '''创建一个存满各种url的worker方法的列表，
+        并发执行worker，执行完放None'''
+
+
+class Parser:
+    def __init__(self, page_q, item_q):
+        self.page_q = page_q
+        self.item_q = item_q
+        self.pool = ThreadPoolExecutor(max_workers=2)
+        # 还是哔哔一堆，拿到队列和线程池
+
+    def parse(self, html):
+        soup = BeautifulSoup(html, 'lxml')
+        title = soup.title.string if soup.title else 'None'
+        return title
+        # 同步解析逻辑，一个run们的工具
+
+    async def run_a(self):
+        while True:
+            rs = await self.page_q.get()
+            if rs is None:
+                logging.info('单核解析队列结束')
+                await self.item_q.put(None)
+                break
+            url, html = rs
+            title = self.parse(html)
+            res = Data(title, url)
+            await self.item_q.put(res)
+        '''单核逻辑，用parse拿数据，放进Data丢给队
+        列'''
+
+    async def run_b(self):
+        loop = asyncio.get_running_loop()
+        failed = []
+        while True:
+            rs = await self.page_q.get()
+            if rs is None:
+                logging.info('多核解析队列结束')
+                break
+            url, html = rs
+            try:
+                title = await loop.run_in_executor(
+                    self.pool,
+                    self.parse,
+                    html
+                )
+                res = Data(title, url)
+                await self.item_q.put(res)
+            except:
+                failed.append((url, html))
+        await loop.run_in_executor(
+        None,
+        self.pool.shutdown,
+        True
+        )
+        return failed
+        
+        '''
+        多核逻辑加降级处理，最操蛋的玩意
+        总体与单核相差不大
+        调用改成线程池的调用方法
+        池子里依次传：线程、调用的方法、方法的
+        参数'''
+
+    async def run_a_try(self, failed):
+        try:
+            for url, html in failed:
+                title = self.parse(html)
+                res = Data(title, url)
+                await self.item_q.put(res)
+        except Exception as e:
+            logging.error('单核再解析失败,真没辙了')
+        '''解析failed列表的单核解析逻辑'''
+
+    async def run(self, pattern=1):
+        if pattern == 1:
+            failed = []
+            await self.run_a()
+        if pattern > 1:
+            failed = await self.run_b()
+        if failed:
+            logging.info('多核出现解析失败,切换至单核再解析')
+            await self.run_a_try(failed)
+        await self.item_q.put(None)
+        if not any([pattern == 1, pattern > 1]):
+            raise ValueError('CPU核数错误')
+        '''总调用，负责模式选择和降级与补刀
+        逻辑'''
+
+
+class Pipeline:
+    def __init__(self, item_q, f):
+        self.item_q = item_q
+        self.f = f
+
+    async def run(self):
+        while True:
+            rt = await self.item_q.get()
+            if rt is None:
+                logging.info('存档下载完成')
+                break
+            await self.f.write(f'{rt}\n')
+        '''最简单的一个，负责保存'''
+
+
+async def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S')
+    '''设置日志'''
+
+    async with aiofiles.open('box.txt', 'a', encoding='utf-8') as f:
+        page_q = asyncio.Queue(maxsize=40)
+        item_q = asyncio.Queue(maxsize=20)
+        sem = asyncio.Semaphore(5)
+        url = [
+            'https://example.com',
+            'https://baidu.com',
+            'https://kugou.com',
+            'https://bilibili.com'
+        ]
+        timeout = 5
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        '''定义一堆参数'''
+
+        spiders = Spiders(url, headers, timeout, page_q, sem)
+        parser = Parser(page_q, item_q)
+        pipeline = Pipeline(item_q, f)
+        logging.info('爬虫开始行动')
+        '''传进参数 to 工作类里'''
+
+        await asyncio.gather(
+            spiders.run(),
+            parser.run(),
+            pipeline.run()
+        )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
